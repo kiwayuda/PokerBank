@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PokerBank – Buy-in Tracker</title>
+<style>
+  :root{--bg:#0f1a14;--card:#16251c;--line:#27402f;--txt:#e8f1ea;--mut:#8fa898;--acc:#3ecf74;--bad:#ff6b6b;--warn:#f5b942;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font:15px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  header{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 16px;background:#0b130e;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+  header h1{font-size:18px;margin:0 8px 0 0}
+  main{max-width:960px;margin:0 auto;padding:16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:16px}
+  .card h2{margin:0 0 10px;font-size:16px}
+  .card h2 small{color:var(--mut);font-weight:400;margin-left:6px}
+  input,select,button{font:inherit;color:var(--txt);background:#0d1812;border:1px solid var(--line);border-radius:6px;padding:7px 10px}
+  button{cursor:pointer;background:#1d3427}
+  button:hover{border-color:var(--acc)}
+  button.primary{background:var(--acc);color:#04210f;border-color:var(--acc);font-weight:600}
+  button.danger{color:var(--bad)}
+  button.sm{padding:3px 8px;font-size:13px}
+  .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  table{width:100%;border-collapse:collapse}
+  th,td{text-align:right;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th:first-child,td:first-child{text-align:left}
+  th{color:var(--mut);font-weight:500;font-size:13px}
+  tfoot td{font-weight:700;border-bottom:none}
+  .scroll{overflow-x:auto}
+  .pos{color:var(--acc)} .neg{color:var(--bad)} .mut{color:var(--mut)}
+  .badge{display:inline-block;font-size:12px;padding:1px 8px;border-radius:99px;border:1px solid var(--line)}
+  .badge.in{color:var(--warn);border-color:var(--warn)} .badge.out{color:var(--mut)}
+  .banner{padding:10px 12px;border-radius:8px;margin-bottom:10px;border:1px solid}
+  .banner.ok{border-color:var(--acc);color:var(--acc)}
+  .banner.under{border-color:var(--warn);color:var(--warn)}
+  .banner.over{border-color:var(--bad);color:var(--bad)}
+  .note{color:var(--mut);font-size:13px;margin:6px 0 0}
+  .warn{color:var(--warn);font-size:13px;margin:4px 0}
+  details{margin-top:8px} summary{cursor:pointer;color:var(--mut)}
+  .final-locked{opacity:.85}
+</style>
+</head>
+<body>
+<header>
+  <h1>♠ PokerBank</h1>
+  <select id="sessionSel" title="Switch session"></select>
+  <button id="newBtn" class="primary">+ New session</button>
+  <button id="renameBtn">Rename</button>
+  <button id="delBtn" class="danger">Delete</button>
+  <span style="flex:1"></span>
+  <button id="exportBtn">Export backup</button>
+  <button id="importBtn">Import</button>
+  <input type="file" id="importFile" accept="application/json" hidden>
+</header>
+
+<main id="app"></main>
+
+<script>
+/* ---------- money helpers (all math in integer cents) ---------- */
+const toCents = v => Math.round(parseFloat(String(v).replace(/[$,]/g,'')) * 100);
+const fmt = c => (c < 0 ? '-' : '') + '$' + (Math.abs(c) / 100).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+const sgn = c => (c > 0 ? '+' : '') + fmt(c);
+const cls = c => c > 0 ? 'pos' : c < 0 ? 'neg' : 'mut';
+const esc = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+const uid = () => Math.random().toString(36).slice(2, 10);
+const nowLocal = () => { const d = new Date(); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0,16); };
+const fmtTime = t => { const d = new Date(t); return isNaN(d) ? '' : d.toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}); };
+
+/* ---------- storage ---------- */
+const KEY = 'pokerbank.v1';
+let state = load();
+function load(){
+  try { const s = JSON.parse(localStorage.getItem(KEY)); if (s && s.sessions) return s; } catch(e){}
+  return { sessions: [], currentId: null };
+}
+function save(){ localStorage.setItem(KEY, JSON.stringify(state)); }
+const cur = () => state.sessions.find(s => s.id === state.currentId);
+function newSession(name){
+  const s = { id: uid(), name: name || ('Game ' + new Date().toLocaleDateString()), created: Date.now(), entries: [], finalized: false };
+  state.sessions.unshift(s); state.currentId = s.id; save(); return s;
+}
+if (!state.sessions.length) newSession();
+if (!cur()) state.currentId = state.sessions[0].id;
+
+/* ---------- core calculation ----------
+   A player is identified by name (case-insensitive). Every buy-in and cash-out is its own
+   timestamped ledger entry, so a player can buy in, cash out, and come back with a different
+   amount any number of times. Player totals = sum of ALL their buy-ins and ALL their cash-outs. */
+function compute(s){
+  const map = new Map();
+  const sorted = [...s.entries].sort((a,b) => (a.time||'').localeCompare(b.time||'') || a.seq - b.seq);
+  for (const e of sorted){
+    const k = e.player.trim().toLowerCase();
+    if (!map.has(k)) map.set(k, { name: e.player.trim(), buyIns: 0, cashOuts: 0, inC: 0, outC: 0, last: null });
+    const p = map.get(k);
+    if (e.type === 'in'){ p.buyIns++; p.inC += e.amount; } else { p.cashOuts++; p.outC += e.amount; }
+    p.last = e.type;
+  }
+  const players = [...map.values()];
+  players.forEach(p => { p.net = p.outC - p.inC; p.adj = 0; });
+  const totalIn = players.reduce((a,p) => a + p.inC, 0);
+  const totalOut = players.reduce((a,p) => a + p.outC, 0);
+  const diff = totalIn - totalOut;      // >0: under cashed out (money missing from payouts); <0: over cashed out
+  let targets = [], resolvable = true;
+  if (diff > 0) targets = players.filter(p => p.net < 0).sort((a,b) => a.net - b.net);   // losers get refunded
+  if (diff < 0) targets = players.filter(p => p.net > 0).sort((a,b) => b.net - a.net);   // winners get docked
+  if (diff !== 0){
+    if (!targets.length) resolvable = false;
+    else {
+      const amt = Math.abs(diff), n = targets.length, base = Math.floor(amt / n);
+      let rem = amt - base * n;                       // leftover cents go 1 each to the biggest loser/winner first
+      targets.forEach(p => { p.adj = (base + (rem-- > 0 ? 1 : 0)) * (diff > 0 ? 1 : -1); });
+    }
+  }
+  players.forEach(p => { p.finalOut = p.outC + p.adj; p.finalNet = p.net + p.adj; });
+  players.sort((a,b) => b.net - a.net);
+  const stillIn = players.filter(p => p.last === 'in');
+  const overCap = targets.filter(p => diff > 0 ? p.adj > -p.net : -p.adj > p.net);
+  return { players, totalIn, totalOut, diff, targets, resolvable, stillIn, overCap };
+}
+
+/* ---------- UI ---------- */
+const $ = id => document.getElementById(id);
+let draft = { player: '', type: 'in', amount: '', time: nowLocal() };
+
+function render(){
+  const s = cur(), c = compute(s);
+  $('sessionSel').innerHTML = state.sessions.map(x => `<option value="${x.id}" ${x.id===s.id?'selected':''}>${esc(x.name)}</option>`).join('');
+
+  const names = c.players.map(p => p.name);
+  const kind = c.diff === 0 ? 'ok' : c.diff > 0 ? 'under' : 'over';
+  const bannerTxt = c.diff === 0
+    ? `✅ Balanced: buy-ins ${fmt(c.totalIn)} = cash-outs ${fmt(c.totalOut)}.`
+    : c.diff > 0
+      ? `⚠️ Under cashed out by <b>${fmt(c.diff)}</b> — more went in (${fmt(c.totalIn)}) than came out (${fmt(c.totalOut)}). Recount the chips / check for a missed cash-out. If it stands, losers get refunded evenly.`
+      : `⚠️ Over cashed out by <b>${fmt(-c.diff)}</b> — more came out (${fmt(c.totalOut)}) than went in (${fmt(c.totalIn)}). Check for a missed buy-in. If it stands, winners are docked evenly.`;
+
+  $('app').innerHTML = `
+  <div class="card">
+    <h2>Add entry <small>${esc(s.name)}</small></h2>
+    <form id="addForm" class="row">
+      <input id="fPlayer" list="plist" placeholder="Player name" required value="${esc(draft.player)}" autocomplete="off" style="flex:1;min-width:130px">
+      <datalist id="plist">${names.map(n => `<option value="${esc(n)}">`).join('')}</datalist>
+      <select id="fType"><option value="in" ${draft.type==='in'?'selected':''}>Buy-in</option><option value="out" ${draft.type==='out'?'selected':''}>Cash-out</option></select>
+      <input id="fAmt" type="number" step="0.01" min="0" placeholder="Amount $" required value="${esc(draft.amount)}" style="width:120px">
+      <input id="fTime" type="datetime-local" value="${draft.time}">
+      <button class="primary">Add</button>
+    </form>
+    <p class="note">Re-using a name adds to the same player. A player can buy in, cash out, and rejoin later with a new buy-in — every entry is logged separately and totals are summed.</p>
+  </div>
+
+  <div class="card">
+    <h2>Subtotals <small>before discrepancy adjustment</small></h2>
+    <div class="scroll"><table>
+      <thead><tr><th>Player</th><th>Status</th><th>Buy-ins</th><th>Total in</th><th>Cash-outs</th><th>Total out</th><th>Net</th><th></th></tr></thead>
+      <tbody>${c.players.map(p => `<tr>
+        <td>${esc(p.name)}</td>
+        <td><span class="badge ${p.last==='in'?'in':'out'}">${p.last==='in'?'at table':'cashed out'}</span></td>
+        <td>${p.buyIns}</td><td>${fmt(p.inC)}</td><td>${p.cashOuts}</td><td>${fmt(p.outC)}</td>
+        <td class="${cls(p.net)}">${sgn(p.net)}</td>
+        <td><button class="sm" data-quick="in" data-p="${esc(p.name)}">+ Buy-in</button> <button class="sm" data-quick="out" data-p="${esc(p.name)}">Cash out</button></td>
+      </tr>`).join('') || `<tr><td colspan="8" class="mut" style="text-align:center">No entries yet.</td></tr>`}</tbody>
+      <tfoot><tr><td>Total</td><td></td><td></td><td>${fmt(c.totalIn)}</td><td></td><td>${fmt(c.totalOut)}</td><td class="${cls(-c.diff)}">${sgn(-c.diff)}</td><td></td></tr></tfoot>
+    </table></div>
+    ${c.stillIn.length ? `<p class="warn">Still at the table (last entry is a buy-in, no cash-out after): ${c.stillIn.map(p=>esc(p.name)).join(', ')}. Record their cash-outs before treating the discrepancy as real.</p>` : ''}
+  </div>
+
+  <div class="card">
+    <h2>Discrepancy check</h2>
+    <div class="banner ${kind}">${bannerTxt}</div>
+    <p class="note">Nothing is adjusted above. Investigate/recount first — edit or delete entries in the ledger and these numbers update live. Only when you're satisfied, apply the split below.</p>
+  </div>
+
+  <div class="card ${s.finalized?'final-locked':''}">
+    <h2>Final settlement <small>after discrepancy split</small></h2>
+    ${!s.finalized ? `
+      <button class="primary" id="finalizeBtn" ${c.players.length?'':'disabled'}>Apply discrepancy split &amp; show final</button>
+      <p class="note">${c.diff===0 ? 'No discrepancy — final equals subtotals.' :
+        c.diff>0 ? `Will refund ${fmt(c.diff)} evenly across ${c.targets.length} loser(s).` :
+                   `Will remove ${fmt(-c.diff)} evenly from ${c.targets.length} winner(s).`}</p>
+    ` : `
+      <div class="scroll"><table>
+        <thead><tr><th>Player</th><th>Total in</th><th>Reported out</th><th>Adjustment</th><th>Final cash-out</th><th>Final net</th></tr></thead>
+        <tbody>${c.players.map(p => `<tr>
+          <td>${esc(p.name)}</td><td>${fmt(p.inC)}</td><td>${fmt(p.outC)}</td>
+          <td class="${cls(p.adj)}">${p.adj?sgn(p.adj):'—'}</td><td><b>${fmt(p.finalOut)}</b></td>
+          <td class="${cls(p.finalNet)}">${sgn(p.finalNet)}</td></tr>`).join('')}</tbody>
+        <tfoot><tr><td>Total</td><td>${fmt(c.totalIn)}</td><td>${fmt(c.totalOut)}</td>
+          <td>${sgn(c.players.reduce((a,p)=>a+p.adj,0))}</td>
+          <td>${fmt(c.players.reduce((a,p)=>a+p.finalOut,0))}</td>
+          <td>${sgn(c.players.reduce((a,p)=>a+p.finalNet,0))}</td></tr></tfoot>
+      </table></div>
+      <p class="note">Final cash-outs ${c.resolvable && c.players.reduce((a,p)=>a+p.finalOut,0)===c.totalIn ? 'sum exactly to total buy-ins ✔' : 'do NOT balance — see warning'}.</p>
+      <div style="margin-top:8px"><button id="reopenBtn">Reopen (undo split)</button></div>
+    `}
+    ${!c.resolvable ? `<p class="warn">Can't split: there are no ${c.diff>0?'losers to refund':'winners to dock'}.</p>` : ''}
+    ${c.overCap.length ? `<p class="warn">Even split exceeds ${c.overCap.map(p=>esc(p.name)).join(', ')}'s ${c.diff>0?'loss (they\'d end up in profit)':'winnings (they\'d end up at a loss)'}. Consider recounting.</p>` : ''}
+  </div>
+
+  <div class="card">
+    <h2>Ledger <small>${s.entries.length} entries, chronological</small></h2>
+    <div class="scroll"><table>
+      <thead><tr><th>Time</th><th>Player</th><th>Type</th><th>Amount</th><th></th></tr></thead>
+      <tbody>${[...s.entries].sort((a,b)=>(a.time||'').localeCompare(b.time||'')||a.seq-b.seq).map(e => `<tr>
+        <td class="mut">${fmtTime(e.time)}</td><td>${esc(e.player)}</td>
+        <td>${e.type==='in'?'Buy-in':'Cash-out'}</td><td class="${e.type==='in'?'neg':'pos'}">${fmt(e.amount)}</td>
+        <td><button class="sm" data-edit="${e.id}">Edit</button> <button class="sm danger" data-del="${e.id}">✕</button></td></tr>`).join('')
+        || `<tr><td colspan="5" class="mut" style="text-align:center">Empty.</td></tr>`}</tbody>
+    </table></div>
+  </div>
+
+  <details class="card"><summary>How rejoining &amp; the discrepancy split work</summary>
+    <p><b>Rejoining:</b> there are no "sessions per player" — the game keeps one chronological ledger of buy-ins and cash-outs. A player is matched by name (case-insensitive). If Sam buys in $100, cashes out $40, then returns later and buys in $50 and cashes out $120, the ledger holds four entries; Sam's totals are in = $150, out = $160, net = +$10. The Status badge shows "at table" if their latest entry is a buy-in, "cashed out" if it's a cash-out. Use the "+ Buy-in" button on a row to quickly add a re-buy or rejoin.</p>
+    <p><b>Discrepancy:</b> Subtotals are exactly what was recorded. Total in − total out = discrepancy. If positive (under cashed out), it's refunded evenly across everyone with a net loss. If negative (over cashed out), it's removed evenly from everyone with a net win. Splits are in cents; leftover pennies go one each to the biggest loser/winner first. The split only shows in the Final section once you click apply, and you can reopen it to keep investigating.</p>
+  </details>`;
+  bind();
+}
+
+function bind(){
+  const s = cur();
+  $('addForm').onsubmit = ev => {
+    ev.preventDefault();
+    const player = $('fPlayer').value.trim(), amount = toCents($('fAmt').value);
+    if (!player || !(amount >= 0)) return;
+    // keep the capitalisation of an existing player so names stay consistent
+    const existing = s.entries.find(e => e.player.trim().toLowerCase() === player.toLowerCase());
+    s.entries.push({ id: uid(), seq: Date.now(), player: existing ? existing.player : player, type: $('fType').value, amount, time: $('fTime').value || nowLocal() });
+    s.finalized = false;   // data changed, so the split must be re-applied after re-checking
+    draft = { player: '', type: $('fType').value, amount: '', time: nowLocal() };
+    save(); render(); $('fPlayer').focus();
+  };
+  document.querySelectorAll('[data-quick]').forEach(b => b.onclick = () => {
+    draft = { player: b.dataset.p, type: b.dataset.quick, amount: '', time: nowLocal() };
+    render(); $('fAmt').focus(); window.scrollTo({top:0,behavior:'smooth'});
+  });
+  document.querySelectorAll('[data-del]').forEach(b => b.onclick = () => {
+    if (!confirm('Delete this entry?')) return;
+    s.entries = s.entries.filter(e => e.id !== b.dataset.del); s.finalized = false; save(); render();
+  });
+  document.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => {
+    const e = s.entries.find(x => x.id === b.dataset.edit);
+    const v = prompt(`New amount for ${e.player} ${e.type==='in'?'buy-in':'cash-out'} ($):`, (e.amount/100).toFixed(2));
+    if (v === null) return; const c = toCents(v); if (!(c >= 0)) return alert('Invalid amount');
+    e.amount = c; s.finalized = false; save(); render();
+  });
+  const f = $('finalizeBtn'); if (f) f.onclick = () => { s.finalized = true; save(); render(); };
+  const r = $('reopenBtn'); if (r) r.onclick = () => { s.finalized = false; save(); render(); };
+}
+
+$('sessionSel').onchange = e => { state.currentId = e.target.value; draft = { player:'', type:'in', amount:'', time: nowLocal() }; save(); render(); };
+$('newBtn').onclick = () => { const n = prompt('Session name:', 'Game ' + new Date().toLocaleDateString()); if (n === null) return; newSession(n.trim()); render(); };
+$('renameBtn').onclick = () => { const n = prompt('Rename session:', cur().name); if (n && n.trim()){ cur().name = n.trim(); save(); render(); } };
+$('delBtn').onclick = () => {
+  if (!confirm(`Delete "${cur().name}" permanently?`)) return;
+  state.sessions = state.sessions.filter(x => x.id !== state.currentId);
+  if (!state.sessions.length) newSession(); else state.currentId = state.sessions[0].id;
+  save(); render();
+};
+$('exportBtn').onclick = () => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(state, null, 2)], {type:'application/json'}));
+  a.download = 'pokerbank-backup-' + new Date().toISOString().slice(0,10) + '.json'; a.click();
+};
+$('importBtn').onclick = () => $('importFile').click();
+$('importFile').onchange = async e => {
+  const file = e.target.files[0]; if (!file) return;
+  try {
+    const d = JSON.parse(await file.text());
+    if (!d.sessions || !Array.isArray(d.sessions)) throw 0;
+    if (!confirm('Replace all current sessions with this backup?')) return;
+    state = d; if (!cur()) state.currentId = state.sessions[0]?.id; if (!state.sessions.length) newSession();
+    save(); render();
+  } catch(_) { alert('That file is not a valid PokerBank backup.'); }
+  e.target.value = '';
+};
+
+render();
+</script>
+</body>
+</html>
