@@ -75,11 +75,14 @@ const fmtTime = t => { const d = new Date(t); return isNaN(d) ? '' : d.toLocaleS
 /* ---------- storage ---------- */
 const KEY = 'pokerbank.v1';
 let state = load();
+let persisting = true;
 function load(){
   try { const s = JSON.parse(localStorage.getItem(KEY)); if (s && s.sessions) return s; } catch(e){}
   return { sessions: [], currentId: null };
 }
-function save(){ localStorage.setItem(KEY, JSON.stringify(state)); }
+function save(){
+  try { localStorage.setItem(KEY, JSON.stringify(state)); persisting = true; } catch(e){ persisting = false; }
+}
 const cur = () => state.sessions.find(s => s.id === state.currentId);
 function newSession(name){
   const s = { id: uid(), name: name || ('Game ' + new Date().toLocaleDateString()), created: Date.now(), entries: [], finalized: false };
@@ -125,6 +128,32 @@ function compute(s){
   return { players, totalIn, totalOut, diff, targets, resolvable, stillIn, overCap };
 }
 
+/* ---------- in-page dialogs (prompt/confirm can be blocked in sandboxed previews) ---------- */
+function dialog({title, msg, input, textarea, ok='OK', cancel='Cancel', extra}){
+  return new Promise(res => {
+    const o = document.createElement('div');
+    o.style.cssText = 'position:fixed;inset:0;background:#000a;z-index:99;display:flex;align-items:center;justify-content:center;padding:16px';
+    o.innerHTML = `<div class="card" style="width:100%;max-width:440px;margin:0">
+      <h2>${esc(title||'')}</h2><p style="margin:0 0 10px">${esc(msg||'')}</p>
+      ${input!==undefined ? `<input id="dlgIn" style="width:100%" value="${esc(input)}">` : ''}
+      ${textarea!==undefined ? `<textarea id="dlgTa" rows="8" style="width:100%;font:12px monospace;color:var(--txt);background:#0a1230;border:1px solid var(--edge);border-radius:9px;padding:8px">${esc(textarea)}</textarea>` : ''}
+      <div class="row" style="margin-top:12px;justify-content:flex-end">
+        ${extra ? `<button id="dlgX">${esc(extra.label)}</button>` : ''}
+        ${cancel ? `<button id="dlgNo">${esc(cancel)}</button>` : ''}<button id="dlgOk" class="primary">${esc(ok)}</button></div></div>`;
+    document.body.appendChild(o);
+    const val = () => $('dlgIn') ? $('dlgIn').value : $('dlgTa') ? $('dlgTa').value : true;
+    const done = v => { o.remove(); res(v); };
+    $('dlgOk').onclick = () => done(val());
+    if ($('dlgNo')) $('dlgNo').onclick = () => done(null);
+    if ($('dlgX')) $('dlgX').onclick = () => extra.fn($('dlgTa'));
+    o.onkeydown = e => { if (e.key === 'Enter' && $('dlgIn')) done(val()); if (e.key === 'Escape') done(null); };
+    (o.querySelector('input,textarea')||$('dlgOk')).focus();
+  });
+}
+const askText = (title, def) => dialog({title, input: def});
+const askYes = (msg, ok='Delete') => dialog({title:'Confirm', msg, ok}).then(v => v === true);
+const tell = msg => dialog({title:'Notice', msg, cancel:null});
+
 /* ---------- UI ---------- */
 const $ = id => document.getElementById(id);
 let draft = { player: '', type: 'in', amount: '', time: nowLocal() };
@@ -142,6 +171,7 @@ function render(){
       : `⚠️ Over cashed out by <b>${fmt(-c.diff)}</b> — more came out (${fmt(c.totalOut)}) than went in (${fmt(c.totalIn)}). Check for a missed buy-in. If it stands, winners are docked evenly.`;
 
   $('app').innerHTML = `
+  ${persisting ? '' : '<div class="banner under">⚠️ This browser is blocking local storage, so sessions will NOT be saved after you close the page. Open the file directly in Safari/Chrome (not a preview) — and use Export backup to keep your data.</div>'}
   <div class="card">
     <h2>Add entry <small>${esc(s.name)}</small></h2>
     <form id="addForm" class="row">
@@ -239,14 +269,14 @@ function bind(){
     draft = { player: b.dataset.p, type: b.dataset.quick, amount: '', time: nowLocal() };
     render(); $('fAmt').focus(); window.scrollTo({top:0,behavior:'smooth'});
   });
-  document.querySelectorAll('[data-del]').forEach(b => b.onclick = () => {
-    if (!confirm('Delete this entry?')) return;
+  document.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+    if (!await askYes('Delete this entry?')) return;
     s.entries = s.entries.filter(e => e.id !== b.dataset.del); s.finalized = false; save(); render();
   });
-  document.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => {
+  document.querySelectorAll('[data-edit]').forEach(b => b.onclick = async () => {
     const e = s.entries.find(x => x.id === b.dataset.edit);
-    const v = prompt(`New amount for ${e.player} ${e.type==='in'?'buy-in':'cash-out'} ($):`, (e.amount/100).toFixed(2));
-    if (v === null) return; const c = toCents(v); if (!(c >= 0)) return alert('Invalid amount');
+    const v = await askText(`New amount for ${e.player} ${e.type==='in'?'buy-in':'cash-out'} ($)`, (e.amount/100).toFixed(2));
+    if (v === null) return; const c = toCents(v); if (!(c >= 0)) return tell('Invalid amount');
     e.amount = c; s.finalized = false; save(); render();
   });
   const f = $('finalizeBtn'); if (f) f.onclick = () => { s.finalized = true; save(); render(); };
@@ -254,31 +284,34 @@ function bind(){
 }
 
 $('sessionSel').onchange = e => { state.currentId = e.target.value; draft = { player:'', type:'in', amount:'', time: nowLocal() }; save(); render(); };
-$('newBtn').onclick = () => { const n = prompt('Session name:', 'Game ' + new Date().toLocaleDateString()); if (n === null) return; newSession(n.trim()); render(); };
-$('renameBtn').onclick = () => { const n = prompt('Rename session:', cur().name); if (n && n.trim()){ cur().name = n.trim(); save(); render(); } };
-$('delBtn').onclick = () => {
-  if (!confirm(`Delete "${cur().name}" permanently?`)) return;
+$('newBtn').onclick = async () => { const n = await askText('New session name', 'Game ' + new Date().toLocaleDateString()); if (n === null) return; newSession(n.trim()); render(); };
+$('renameBtn').onclick = async () => { const n = await askText('Rename session', cur().name); if (n && n.trim()){ cur().name = n.trim(); save(); render(); } };
+$('delBtn').onclick = async () => {
+  if (!await askYes(`Delete "${cur().name}" permanently?`)) return;
   state.sessions = state.sessions.filter(x => x.id !== state.currentId);
   if (!state.sessions.length) newSession(); else state.currentId = state.sessions[0].id;
   save(); render();
 };
 $('exportBtn').onclick = () => {
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([JSON.stringify(state, null, 2)], {type:'application/json'}));
-  a.download = 'pokerbank-backup-' + new Date().toISOString().slice(0,10) + '.json'; a.click();
+  const json = JSON.stringify(state, null, 2);
+  dialog({title:'Export backup', msg:'Copy this text and keep it somewhere safe, or download it as a file.', textarea:json, ok:'Close', cancel:null,
+    extra:{label:'Download file', fn: () => { const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([json], {type:'application/json'}));
+      a.download = 'pokerbank-backup-' + new Date().toISOString().slice(0,10) + '.json'; document.body.appendChild(a); a.click(); a.remove(); }}});
 };
-$('importBtn').onclick = () => $('importFile').click();
-$('importFile').onchange = async e => {
-  const file = e.target.files[0]; if (!file) return;
+$('importBtn').onclick = async () => {
+  const txt = await dialog({title:'Import backup', msg:'Paste a backup (JSON) below. This replaces all current sessions.', textarea:'', ok:'Import', extra:{label:'Choose file…', fn: () => $('importFile').click()}});
+  if (txt) doImport(txt);
+};
+$('importFile').onchange = async e => { const f = e.target.files[0]; if (f) { document.querySelector('#dlgNo')?.click(); doImport(await f.text()); } e.target.value = ''; };
+function doImport(text){
   try {
-    const d = JSON.parse(await file.text());
+    const d = JSON.parse(text);
     if (!d.sessions || !Array.isArray(d.sessions)) throw 0;
-    if (!confirm('Replace all current sessions with this backup?')) return;
-    state = d; if (!cur()) state.currentId = state.sessions[0]?.id; if (!state.sessions.length) newSession();
+    state = d; if (!state.sessions.length) newSession(); else if (!cur()) state.currentId = state.sessions[0].id;
     save(); render();
-  } catch(_) { alert('That file is not a valid PokerBank backup.'); }
-  e.target.value = '';
-};
+  } catch(_) { tell('That is not a valid PokerBank backup.'); }
+}
 
 render();
 </script>
