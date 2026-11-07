@@ -294,10 +294,8 @@ $('delBtn').onclick = async () => {
 };
 $('exportBtn').onclick = () => {
   const json = JSON.stringify(state, null, 2);
-  dialog({title:'Export backup', msg:'Copy this text and keep it somewhere safe, or download it as a file.', textarea:json, ok:'Close', cancel:null,
-    extra:{label:'Download file', fn: () => { const a = document.createElement('a');
-      a.href = URL.createObjectURL(new Blob([json], {type:'application/json'}));
-      a.download = 'pokerbank-backup-' + new Date().toISOString().slice(0,10) + '.json'; document.body.appendChild(a); a.click(); a.remove(); }}});
+  dialog({title:'Export backup', msg:'Copy this text and keep it somewhere safe (e.g. in Notes). You can paste it back with Import.', textarea:json, ok:'Close', cancel:null,
+    extra:{label:'Copy', fn: async ta => { ta.select(); try { await navigator.clipboard.writeText(ta.value); } catch(e){ try{ document.execCommand('copy'); }catch(_){} } }}});
 };
 $('importBtn').onclick = async () => {
   const txt = await dialog({title:'Import backup', msg:'Paste a backup (JSON) below. This replaces all current sessions.', textarea:'', ok:'Import', extra:{label:'Choose file…', fn: () => $('importFile').click()}});
